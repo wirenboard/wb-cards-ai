@@ -1,0 +1,34 @@
+services:
+  processor:
+    build: ./processor
+    restart: unless-stopped
+    environment:
+      OPENAI_API_KEY: ${OPENAI_API_KEY}
+      OPENAI_MODEL: ${OPENAI_MODEL}
+      ZAMMAD_BASE_URL: ${ZAMMAD_BASE_URL}
+      ZAMMAD_API_TOKEN: ${ZAMMAD_API_TOKEN}
+      ZAMMAD_GROUP: ${ZAMMAD_GROUP}
+      ZAMMAD_FALLBACK_CUSTOMER_EMAIL: ${ZAMMAD_FALLBACK_CUSTOMER_EMAIL}
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN}
+      TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID}
+      TELEGRAM_WEBHOOK_SECRET: ${TELEGRAM_WEBHOOK_SECRET}
+      TELEGRAM_COMBINE_WINDOW_SEC: ${TELEGRAM_COMBINE_WINDOW_SEC}
+
+  caddy:
+    image: caddy:2.8.4-alpine
+    restart: unless-stopped
+    depends_on:
+      - processor
+    environment:
+      DOMAIN: ${DOMAIN}
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+
+volumes:
+  caddy_data:
+  caddy_config:
