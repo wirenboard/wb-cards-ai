@@ -1,16 +1,13 @@
-import base64, hmac, json, logging, os, re, time
+import asyncio, base64, json, logging, os, re, time
 import httpx
-from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse
 from openai import AsyncOpenAI
 
 logging.basicConfig(level=logging.INFO)
 # httpx логирует полный URL на уровне INFO, а Telegram кладёт токен бота прямо в URL —
 # глушим его логгер до WARNING, чтобы токен не утекал в логи.
 logging.getLogger("httpx").setLevel(logging.WARNING)
-log = logging.getLogger("processor")
+log = logging.getLogger("bot")
 
-app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
 ai = AsyncOpenAI(api_key=os.environ["OPENAI_API_KEY"])
 
 ZAMMAD_BASE  = os.environ["ZAMMAD_BASE_URL"].rstrip("/")
@@ -19,8 +16,6 @@ ZAMMAD_GROUP = os.getenv("ZAMMAD_GROUP", "managers")
 FALLBACK_EMAIL = os.getenv("ZAMMAD_FALLBACK_CUSTOMER_EMAIL", "leadbot@example.com")
 MODEL = os.getenv("OPENAI_MODEL", "gpt-4o")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
-TELEGRAM_WEBHOOK_SECRET = os.getenv("TELEGRAM_WEBHOOK_SECRET", "").strip()
 try:
     TELEGRAM_COMBINE_WINDOW_SEC = int(os.getenv("TELEGRAM_COMBINE_WINDOW_SEC") or 600)
 except (TypeError, ValueError):
@@ -225,7 +220,7 @@ async def extract_voice_lead(data: bytes, fname: str, mime: str) -> tuple[dict, 
     return lead, text
 
 
-async def create_ticket_from_voice(data: bytes, fname: str, mime: str, source: str, notify: bool = True) -> tuple[dict, int | None, str]:
+async def create_ticket_from_voice(data: bytes, fname: str, mime: str, source: str) -> tuple[dict, int | None, str]:
     log.info("voice: %s bytes, type=%s", len(data), mime)
     lead, text = await extract_voice_lead(data, fname, mime)
     lead.setdefault("source", source)
@@ -233,8 +228,6 @@ async def create_ticket_from_voice(data: bytes, fname: str, mime: str, source: s
 
     ticket = await zammad_ticket(lead, attachments=[(fname, mime, data)])
     ticket_id = ticket.get("id")
-    if notify:
-        await send_telegram_notice(ticket_id, lead, source)
     return lead, ticket_id, text
 
 
@@ -276,90 +269,15 @@ async def telegram_download_file(file_id: str, fallback_name: str, fallback_mime
         return r.content, filename, mime
 
 
-async def send_telegram_notice(ticket_id: int | None, lead: dict, source: str) -> None:
-    if not TELEGRAM_BOT_TOKEN:
-        return
-
-    chat_id = TELEGRAM_CHAT_ID
-    if not chat_id:
-        chat_id = await discover_telegram_chat_id()
-    if not chat_id:
-        log.warning("Telegram chat_id is unknown. Send any message to the bot first.")
-        return
-
-    text = (
-        "Новый лид\n"
-        f"Источник: {source}\n"
-        f"Тикет: #{ticket_id or '-'}\n"
-        f"Имя: {lead.get('name') or '-'}\n"
-        f"Компания: {lead.get('company') or '-'}\n"
-        f"Телефон: {lead.get('phone') or '-'}\n"
-        f"Email: {lead.get('email') or '-'}"
-    )
-
-    async with httpx.AsyncClient(timeout=12) as c:
-        r = await c.post(
-            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
-            json={
-                "chat_id": chat_id,
-                "text": text,
-                "disable_web_page_preview": True,
-            },
-        )
-        if not r.is_success:
-            log.error("Telegram error %s: %s", r.status_code, r.text)
-
-
-async def discover_telegram_chat_id() -> str:
-    global TELEGRAM_CHAT_ID
-
-    async with httpx.AsyncClient(timeout=10) as c:
-        r = await c.get(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates")
-        if not r.is_success:
-            log.error("Telegram getUpdates error %s: %s", r.status_code, r.text)
-            return ""
-
-        payload = r.json()
-        items = payload.get("result") or []
-        for item in reversed(items):
-            msg = item.get("message") or item.get("edited_message") or {}
-            chat = msg.get("chat") or {}
-            cid = chat.get("id")
-            if cid is not None:
-                TELEGRAM_CHAT_ID = str(cid)
-                return TELEGRAM_CHAT_ID
-    return ""
-
-
-@app.get("/healthz")
-def health():
-    return {"ok": True}
-
-
-@app.post("/webhook/telegram")
-async def telegram_intake(request: Request):
-    if not TELEGRAM_BOT_TOKEN:
-        return JSONResponse({"ok": False, "error": "TELEGRAM_BOT_TOKEN is empty"}, status_code=400)
-
-    if not TELEGRAM_WEBHOOK_SECRET:
-        log.error("TELEGRAM_WEBHOOK_SECRET is not set; refusing to process webhook")
-        return JSONResponse({"ok": False, "error": "server misconfigured"}, status_code=503)
-    got = request.headers.get("x-telegram-bot-api-secret-token", "")
-    if not hmac.compare_digest(got, TELEGRAM_WEBHOOK_SECRET):
-        return JSONResponse({"ok": False, "error": "invalid telegram secret"}, status_code=403)
-
-    try:
-        update = await request.json()
-    except Exception:
-        return JSONResponse({"ok": False, "error": "invalid json"}, status_code=400)
+async def process_update(update: dict) -> None:
     msg = update.get("message") or update.get("edited_message") or {}
     if not msg:
-        return {"ok": True}
+        return
 
     chat = msg.get("chat") or {}
     chat_id = str(chat.get("id") or "")
     if not chat_id:
-        return {"ok": True}
+        return
 
     cleanup_pending_cards()
 
@@ -375,29 +293,29 @@ async def telegram_intake(request: Request):
             f"После фото есть {pending_minutes()} мин. Команды: /done, /cancel.",
             keyboard=MAIN_KEYBOARD,
         )
-        return {"ok": True}
+        return
 
     if text.startswith("/cancel"):
         cancelled = telegram_pending_cards.pop(chat_id, None) or telegram_manual_state.pop(chat_id, None)
         await telegram_send_message(chat_id, "Черновик сброшен." if cancelled else "Активного черновика нет.")
-        return {"ok": True}
+        return
 
     if text == BTN_MANUAL:
         telegram_pending_cards.pop(chat_id, None)
         telegram_manual_state[chat_id] = {"step": 0, "lead": {}, "ts": time.time()}
         await telegram_send_message(chat_id, f"Ручной ввод лида.\n(1/{len(MANUAL_FIELDS)}) {MANUAL_FIELDS[0][1]}")
-        return {"ok": True}
+        return
 
     if text == BTN_CARD:
         telegram_manual_state.pop(chat_id, None)
         await telegram_send_message(chat_id, "Пришлите фото визитки 📷 — распознаю автоматически. Потом можно добавить голос.")
-        return {"ok": True}
+        return
 
     if text.startswith("/done"):
         state = telegram_pending_cards.pop(chat_id, None)
         if not state:
             await telegram_send_message(chat_id, "Нет активной визитки. Сначала отправь фото.")
-            return {"ok": True}
+            return
 
         lead = state.get("lead") or {}
         lead["source"] = "Telegram / визитка"
@@ -410,7 +328,7 @@ async def telegram_intake(request: Request):
             f"Готово. Создан тикет #{ticket_id} (без голоса).\n"
             f"{lead.get('name') or '-'} | {lead.get('company') or '-'} | {lead.get('phone') or '-'}",
         )
-        return {"ok": True}
+        return
 
     if chat_id in telegram_manual_state and text:
         state = telegram_manual_state[chat_id]
@@ -421,7 +339,7 @@ async def telegram_intake(request: Request):
         state["ts"] = time.time()
         if state["step"] < len(MANUAL_FIELDS):
             await telegram_send_message(chat_id, f"({state['step'] + 1}/{len(MANUAL_FIELDS)}) {MANUAL_FIELDS[state['step']][1]}")
-            return {"ok": True}
+            return
         lead = telegram_manual_state.pop(chat_id)["lead"]
         lead["source"] = "Telegram / ручной ввод"
         try:
@@ -435,7 +353,7 @@ async def telegram_intake(request: Request):
         except Exception:
             log.exception("manual lead ticket failed")
             await telegram_send_message(chat_id, "Не удалось создать тикет. Попробуйте позже.")
-        return {"ok": True}
+        return
 
     try:
         if msg.get("photo"):
@@ -444,7 +362,7 @@ async def telegram_intake(request: Request):
             file_id = photos[-1].get("file_id")
             if not file_id:
                 await telegram_send_message(chat_id, "Не удалось прочитать фото. Попробуй еще раз.")
-                return {"ok": True}
+                return
 
             data, fname, mime = await telegram_download_file(file_id, "card.jpg", "image/jpeg")
             lead = await build_card_lead(
@@ -465,14 +383,14 @@ async def telegram_intake(request: Request):
                 "Если голос не нужен, отправь /done. Для сброса /cancel.\n"
                 f"{lead.get('name') or '-'} | {lead.get('company') or '-'} | {lead.get('phone') or '-'}",
             )
-            return {"ok": True}
+            return
 
         voice = msg.get("voice") or msg.get("audio")
         if voice:
             file_id = voice.get("file_id")
             if not file_id:
                 await telegram_send_message(chat_id, "Не удалось прочитать аудио. Попробуй еще раз.")
-                return {"ok": True}
+                return
 
             data, fname, mime = await telegram_download_file(file_id, "voice.ogg", "audio/ogg")
 
@@ -495,41 +413,67 @@ async def telegram_intake(request: Request):
                     f"Готово. Создан один тикет #{ticket_id} (визитка + голос).\n"
                     f"{lead.get('name') or '-'} | {lead.get('company') or '-'} | {lead.get('phone') or '-'}",
                 )
-                return {"ok": True}
+                return
 
             lead, ticket_id, _ = await create_ticket_from_voice(
                 data=data,
                 fname=fname,
                 mime=mime,
                 source="Telegram / голос",
-                notify=False,
             )
             await telegram_send_message(
                 chat_id,
                 f"Готово. Создан тикет #{ticket_id}.\n"
                 f"{lead.get('name') or '-'} | {lead.get('company') or '-'} | {lead.get('phone') or '-'}",
             )
-            return {"ok": True}
+            return
 
         await telegram_send_message(
             chat_id,
             "Не понял. Нажмите кнопку ниже или /start.",
             keyboard=MAIN_KEYBOARD,
         )
-        return {"ok": True}
+        return
 
     except Exception:
-        log.exception("telegram intake failed")
+        log.exception("update handling failed")
         await telegram_send_message(chat_id, "Внутренняя ошибка обработки. Попробуйте позже.")
-        return {"ok": True}
+        return
 
 
-@app.get("/webhook/telegram-test")
-async def telegram_test():
+async def telegram_get_updates(offset: int | None) -> list:
+    params = {"timeout": 30, "allowed_updates": json.dumps(["message"])}
+    if offset is not None:
+        params["offset"] = offset
+    async with httpx.AsyncClient(timeout=60) as c:
+        r = await c.get(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates", params=params)
+        if not r.is_success:
+            log.error("getUpdates error %s: %s", r.status_code, r.text)
+            return []
+        return (r.json() or {}).get("result") or []
+
+
+async def main() -> None:
     if not TELEGRAM_BOT_TOKEN:
-        return JSONResponse({"ok": False, "error": "TELEGRAM_BOT_TOKEN is empty"}, status_code=400)
-    chat_id = TELEGRAM_CHAT_ID or await discover_telegram_chat_id()
-    if not chat_id:
-        return JSONResponse({"ok": False, "error": "TELEGRAM_CHAT_ID is empty; send any message to bot and retry"}, status_code=400)
-    await send_telegram_notice(None, {}, "тест")
-    return {"ok": True, "chat_id": chat_id}
+        raise SystemExit("TELEGRAM_BOT_TOKEN is empty")
+    # Снимаем вебхук, если он был установлен ранее — иначе getUpdates вернёт 409 Conflict.
+    await telegram_api("deleteWebhook", {"drop_pending_updates": False})
+    log.info("bot started (long polling)")
+    offset: int | None = None
+    while True:
+        try:
+            updates = await telegram_get_updates(offset)
+        except Exception:
+            log.exception("getUpdates failed")
+            await asyncio.sleep(3)
+            continue
+        for upd in updates:
+            offset = upd.get("update_id", 0) + 1
+            try:
+                await process_update(upd)
+            except Exception:
+                log.exception("update processing failed")
+
+
+if __name__ == "__main__":
+    asyncio.run(main())

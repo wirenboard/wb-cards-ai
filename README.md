@@ -1,98 +1,66 @@
-# Lead Intake (Telegram)
+# Lead Intake Bot (Telegram, long polling)
 
-Сервис захвата лидов через Telegram-бота:
-- фото визитки (OCR через OpenAI),
-- голосовое сообщение (STT через OpenAI),
-- автоматическое создание тикета в Zammad.
+Внутренний Telegram-бот для захвата лидов с выставки:
+- 📷 фото визитки → OCR (OpenAI),
+- 🎙 голосовое → расшифровка (OpenAI),
+- ✍️ ручной ввод по кнопке (пошаговый опрос полей),
+- автоматическое создание тикета в Zammad (с приложенными фото и голосом).
 
-## Архитектура
+Работает по схеме **long polling** (без вебхуков): не нужны домен, TLS-сертификат, прокси и публичный порт — только исходящий доступ в интернет.
 
-- `processor/` — FastAPI-сервис: приём Telegram-вебхуков, OCR/STT, интеграции OpenAI/Zammad/Telegram.
-- `caddy` — reverse proxy и TLS (принимает webhook Telegram и проксирует в processor).
+## Запуск
 
-## Быстрый запуск
-
-1. Скопируйте файл окружения:
+1. Скопируйте окружение и заполните значения:
 
 ```bash
 cp .env.example .env
 ```
 
-2. Заполните обязательные параметры в `.env`:
+Обязательные: `OPENAI_API_KEY`, `ZAMMAD_BASE_URL`, `ZAMMAD_API_TOKEN`, `ZAMMAD_GROUP`, `ZAMMAD_FALLBACK_CUSTOMER_EMAIL`, `TELEGRAM_BOT_TOKEN`.
 
-- `DOMAIN` — домен сервиса.
-- `OPENAI_API_KEY`
-- `ZAMMAD_BASE_URL`
-- `ZAMMAD_API_TOKEN`
-- `ZAMMAD_GROUP` (обычно `Managers`)
-- `ZAMMAD_FALLBACK_CUSTOMER_EMAIL`
-- `TELEGRAM_BOT_TOKEN`
-- `TELEGRAM_CHAT_ID` (можно оставить пустым и определить позже)
-- `TELEGRAM_WEBHOOK_SECRET` (длинная случайная строка)
-
-3. Поднимите стек:
+2. Поднимите контейнер:
 
 ```bash
-docker compose up -d --build
+docker compose up -d
 ```
 
-4. Установите webhook у Telegram-бота:
+Бот сам снимет вебхук (если был установлен) и начнёт опрашивать Telegram.
 
-```bash
-curl -s "https://api.telegram.org/bot<TELEGRAM_BOT_TOKEN>/setWebhook" \
-	-d "url=https://<DOMAIN>/webhook/telegram" \
-	-d "secret_token=<TELEGRAM_WEBHOOK_SECRET>" \
-	-d "drop_pending_updates=true"
-```
-
-5. Проверьте статус webhook:
-
-```bash
-curl -s "https://api.telegram.org/bot<TELEGRAM_BOT_TOKEN>/getWebhookInfo"
-```
-
-## Эндпоинты
-
-- `GET /healthz` — health check.
-- `POST /webhook/telegram` — входящий webhook Telegram.
-- `GET /webhook/telegram-test` — тест исходящего сообщения в Telegram.
+> ⚠️ Запускайте только **один** экземпляр на токен бота — Telegram допускает лишь одного потребителя `getUpdates`.
 
 ## Работа с ботом
 
-- `/start` — приветствие и инструкция.
-- Фото визитки распознаётся, затем можно прислать голос — всё уйдёт в один тикет.
-- `/done` — создать тикет без голоса.
-- `/cancel` — сбросить черновик визитки.
+- `/start` — приветствие и две кнопки.
+- **✍️ Ввести вручную** — бот по очереди спросит имя, компанию, телефон, email, должность, комментарий (поле можно пропустить, отправив `-`).
+- **📷 Визитка** — пришлите фото; оно распознается. Затем можно прислать голосовое — всё уйдёт в один тикет.
+- `/done` — создать тикет по визитке без голоса.
+- `/cancel` — сбросить черновик.
 
-## Что создается в Zammad
+## Что создаётся в Zammad
 
 - Тикет с полями лида: имя, компания, телефон, email, должность, источник, комментарий.
-- Для голоса дополнительно прикладывается исходный аудиофайл к статье тикета.
+- Прикладываются исходные файлы: фото визитки и/или голосовое сообщение.
 
-## Прод-деплой на удаленный сервер
+## Конфигурация
 
-Пример для Linux-хоста:
+| Переменная | Назначение |
+|------------|-----------|
+| `OPENAI_API_KEY` | ключ OpenAI (vision + whisper) |
+| `OPENAI_MODEL` | модель для OCR/извлечения (напр. `gpt-4.1`) |
+| `ZAMMAD_BASE_URL` | URL Zammad |
+| `ZAMMAD_API_TOKEN` | токен с правом создавать тикеты |
+| `ZAMMAD_GROUP` | группа тикетов (напр. `Managers`) |
+| `ZAMMAD_FALLBACK_CUSTOMER_EMAIL` | email, если у лида не распознан |
+| `TELEGRAM_BOT_TOKEN` | токен бота (@BotFather) |
+| `TELEGRAM_COMBINE_WINDOW_SEC` | окно ожидания голоса после визитки, сек |
 
-```bash
-mkdir -p /opt/lead-intake
-cd /opt/lead-intake
-git clone <repo_url> .
-cp .env.example .env
-# заполните .env
-docker compose up -d --build
-```
+## Деплой
 
-После запуска:
-- Проверьте `https://<DOMAIN>/healthz`.
-- Проверьте `https://<DOMAIN>/webhook/telegram-test`.
-- Отправьте в бота `/start`, фото визитки и voice для e2e проверки.
+Доставка кода на хост — задача инфраструктуры (Portainer / GitHub Actions / роль деплоя). На целевом хосте достаточно получить содержимое репозитория и выполнить `docker compose up -d`.
 
 ## Безопасность
 
 - Никогда не коммитьте `.env`.
 - Регулярно ротируйте `OPENAI_API_KEY`, `ZAMMAD_API_TOKEN`, `TELEGRAM_BOT_TOKEN`.
-- Держите `TELEGRAM_WEBHOOK_SECRET` уникальным и длинным.
-- При утечке сразу:
-	1. Перевыпустить токены,
-	2. Обновить `.env`,
-	3. Перезапустить `processor`.
+- Токен бота не пишется в логи; ПДн в логах сокращены; контейнер работает не от root.
+- Входящих соединений нет — бот ходит только наружу.
