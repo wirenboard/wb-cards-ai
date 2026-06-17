@@ -1,0 +1,3 @@
+# Normalize line endings: store and check out text files as LF everywhere.
+# The service runs in Linux containers, so CRLF must never leak in.
+* text=auto eol=lf
